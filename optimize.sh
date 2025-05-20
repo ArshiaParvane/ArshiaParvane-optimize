@@ -1,5 +1,23 @@
 #!/bin/bash
 
+read -sp "Enter password: " PASSWORD
+echo
+
+CORRECT_PASSWORD="ArshiaParvane"
+
+if [ "$PASSWORD" != "$CORRECT_PASSWORD" ]; then
+  echo "Incorrect password!"
+  exit 1
+fi
+
+AUTHORIZED_SUBSTRING="ArshiaParvane"
+CURRENT_USER=$(whoami)
+
+if [[ "$CURRENT_USER" != *"$AUTHORIZED_SUBSTRING"* ]]; then
+  echo "You are not authorized to run this script."
+  exit 1
+fi
+
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 IP_ADDRESS=$(ip addr show "$INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
 IP_BASE=$(echo $IP_ADDRESS | cut -d. -f1-3)
