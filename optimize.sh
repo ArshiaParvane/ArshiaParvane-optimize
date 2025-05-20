@@ -10,13 +10,13 @@ if [ "$PASSWORD" != "$CORRECT_PASSWORD" ]; then
   exit 1
 fi
 
-AUTHORIZED_SUBSTRING="ArshiaParvane"
-CURRENT_USER=$(whoami)
-
-if [[ "$CURRENT_USER" != *"$AUTHORIZED_SUBSTRING"* ]]; then
-  echo "You are not authorized to run this script."
-  exit 1
-fi
+# نام کاربری چک نمی‌شود
+# CURRENT_USER=$(whoami)
+# AUTHORIZED_SUBSTRING="ArshiaParvane"
+# if [[ "$CURRENT_USER" != *"$AUTHORIZED_SUBSTRING"* ]]; then
+#   echo "You are not authorized to run this script."
+#   exit 1
+# fi
 
 INTERFACE=$(ip route get 8.8.8.8 | awk '{print $5; exit}')
 IP_ADDRESS=$(ip addr show "$INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
