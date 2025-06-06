@@ -1,10 +1,10 @@
 #!/bin/bash
 #
 # optimize.sh
-# اسکریپت نهایی برای اعمال تنظیمات هم‌زمانِ throughput و low-latency روی یک سرور لینوکسی:
+# اسکریپت نهایی برای اعمال تنظیماتِ هم‌زمانِ throughput و low-latency روی یک سرور لینوکسی:
 #
-# • تنظیم sysctl (fq_codel/cake + BBR + Fast Open + بافرها + TIME-WAIT + Keepalive)
-# • بارگذاری ماژول tcp_bbr و ثبت در بوت
+# • تنظیم sysctl (only net.core.default_qdisc + BBR + Fast Open + بافرها + TIME-WAIT + Keepalive)
+# • بارگذاری ماژول tcp_bbr و ثبت آن در بوت
 # • تنظیم MTU اینترفیس پیش‌فرض روی 1420 و افزودن route /24 خودکار
 # • خاموش‌سازی NIC offloadها (GRO, GSO, TSO, LRO) برای کمترین تأخیر
 # • کاهش interrupt coalescing (هر بسته فوراً interrupt تولید کند)
@@ -15,7 +15,7 @@
 #
 # توضیحات:
 #   • اگر سرور از cake پشتیبانی نکند، خودکار fq_codel جایگزین می‌شود.
-#   • برای بازگرداندن MTU و route، باید دستی MTU را به 1500 برگردانید و route /24 را حذف کنید.
+#   • برای بازگرداندن MTU و route، به‌صورت دستی MTU را به 1500 برگردانید و route /24 را حذف کنید.
 #
 set -o errexit
 set -o nounset
@@ -32,7 +32,7 @@ log() {
   echo -e "\e[32m[INFO]\e[0m $1" | tee -a "$LOGFILE"
 }
 
-# مطمئن شو که اسکریپت به‌صورت root اجرا شده
+# مطمئن شو که اسکریپت با کاربر root اجرا می‌شود
 if [ "$(id -u)" -ne 0 ]; then
   die "این اسکریپت باید با دسترسی root اجرا شود."
 fi
@@ -40,12 +40,11 @@ fi
 log "شروع اعمال تنظیمات شبکه برای low-latency و throughput..."
 
 # -----------------------------------------------------------
-# ۱. تنظیم sysctl
+# ۱. تنظیم sysctl برای net.core.default_qdisc و سایر پارامترها
 # -----------------------------------------------------------
 declare -A sysctl_opts=(
-  # Queueing: cake ترجیح داده می‌شود، در غیر این صورت fq_codel
+  # Queueing: ترجیح cake، در صورت عدم پشتیبانی fq_codel
   ["net.core.default_qdisc"]="cake"
-  ["net.ipv4.netdev_default_qdisc"]="cake"
 
   # Congestion Control
   ["net.ipv4.tcp_congestion_control"]="bbr"
@@ -74,7 +73,7 @@ declare -A sysctl_opts=(
 
   # TIME-WAIT reuse
   ["net.ipv4.tcp_tw_reuse"]="1"
-  # ["net.ipv4.tcp_tw_recycle"]="1"   # کامنت شده تا مشکلات NAT پیش نیاید
+  # ["net.ipv4.tcp_tw_recycle"]="1"   # غیرفعال شده تا مشکلات NAT پیش نیاید
 
   # FIN_TIMEOUT و Keepalive
   ["net.ipv4.tcp_fin_timeout"]="15"
@@ -90,15 +89,14 @@ log "اعمال تنظیمات sysctl..."
 for key in "${!sysctl_opts[@]}"; do
   value="${sysctl_opts[$key]}"
 
-  # سعی کن مقدار را مستقیم ست کنی
   if sysctl -w "$key=$value" >/dev/null 2>&1; then
-    # اگر در /etc/sysctl.conf وجود ندارد، ثبتش کن
+    # اگر هنوز در /etc/sysctl.conf ثبت نشده، اضافه‌اش کن
     grep -qxF "$key = $value" /etc/sysctl.conf \
       || echo "$key = $value" >> /etc/sysctl.conf
     log "ثبت و اعمال شد: $key = $value"
   else
-    # فقط برای qdisc: اگر اجرای cake شکست خورد، fq_codel را امتحان کن
-    if [[ "$key" == "net.core.default_qdisc" || "$key" == "net.ipv4.netdev_default_qdisc" ]]; then
+    # فقط برای qdisc: اگر cake ست نشد، fq_codel را امتحان کن
+    if [[ "$key" == "net.core.default_qdisc" ]]; then
       fallback="fq_codel"
       sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "نمی‌توان $key را روی $fallback تنظیم کرد"
       grep -qxF "$key = $fallback" /etc/sysctl.conf \
@@ -111,7 +109,7 @@ for key in "${!sysctl_opts[@]}"; do
 done
 
 sysctl -p >/dev/null 2>&1 || die "بارگذاری مجدد sysctl با خطا مواجه شد."
-log "همهٔ sysctlها اعمال و ذخیره شدند."
+log "تمام sysctlها اعمال و ذخیره شدند."
 
 # -----------------------------------------------------------
 # ۲. بارگذاری ماژول tcp_bbr
@@ -171,7 +169,7 @@ ethtool -K "$IFACE" gro off gso off tso off lro off \
   || log "هشدار: NIC offloadها پشتیبانی نمی‌شوند یا قبلاً خاموش بودند."
 
 # -----------------------------------------------------------
-# ۶. کاهش interrupt coalescing (هر بسته فوراً interrupt تولید شود)
+# ۶. کاهش interrupt coalescing (هر بسته فوراً interrupt تولید کند)
 # -----------------------------------------------------------
 log "کاهش interrupt coalescing روی $IFACE..."
 ethtool -C "$IFACE" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 \
@@ -189,7 +187,7 @@ for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
 done
 
 # -----------------------------------------------------------
-# ۸. خلاصه نهایی و توصیه‌ها
+# ۸. خلاصهٔ نهایی و توصیه‌ها
 # -----------------------------------------------------------
 log "تمام تنظیمات low-latency و throughput اعمال شدند."
 log "برای بررسی وضعیت:"
