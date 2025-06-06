@@ -1,31 +1,27 @@
 #!/bin/bash
 #
-# optimize-lowlat.sh
+# optimize.sh
 # اسکریپت نهایی برای اعمال تنظیمات هم‌زمانِ throughput و low-latency روی یک سرور لینوکسی:
 #
-# • تنظیم sysctl (cake/fq_codel، BBR، Fast Open، بافرها، TIME-WAIT، Keepalive)
+# • تنظیم sysctl (fq_codel/cake + BBR + Fast Open + بافرها + TIME-WAIT + Keepalive)
 # • بارگذاری ماژول tcp_bbr و ثبت در بوت
 # • تنظیم MTU اینترفیس پیش‌فرض روی 1420 و افزودن route /24 خودکار
 # • خاموش‌سازی NIC offloadها (GRO, GSO, TSO, LRO) برای کمترین تأخیر
-# • کاهش interrupt coalescing (هر بسته فوراً interrupt تولید شود)
-# • تخصیص IRQ affinity به یک هسته CPU برای ثبات بیشتر
+# • کاهش interrupt coalescing (هر بسته فوراً interrupt تولید کند)
+# • تخصیص IRQ affinity به یک هستهٔ CPU برای ثبات بیشتر
 #
-# نحوه استفاده:
-#   1) فایل را ذخیره کنید (مثلاً optimize-lowlat.sh) و در گیت‌هاب بارگذاری کنید.
-#   2) آن را اجرایی کنید:
-#        chmod +x optimize-lowlat.sh
-#   3) در هر سروری که می‌خواهید اجرا شود:
-#        curl -fsSL https://raw.githubusercontent.com/YourUser/YourRepo/main/optimize-lowlat.sh | sudo bash
+# نحوهٔ استفاده:
+#   curl -fsSL https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh | sudo bash
 #
-# توجه:
-#   • اگر سرور شما از cake پشتیبانی نکند، اسکریپت به‌صورت خودکار از fq_codel استفاده می‌کند.
-#   • برای بازگرداندن MTU و route خودکار، باید دستی MTU را به 1500 برگردانید و route /24 را حذف کنید.
+# توضیحات:
+#   • اگر سرور از cake پشتیبانی نکند، خودکار fq_codel جایگزین می‌شود.
+#   • برای بازگرداندن MTU و route، باید دستی MTU را به 1500 برگردانید و route /24 را حذف کنید.
 #
 set -o errexit
 set -o nounset
 set -o pipefail
 
-LOGFILE="/var/log/optimize-lowlat.log"
+LOGFILE="/var/log/optimize.log"
 
 die() {
   echo -e "\e[31m[ERROR]\e[0m $1" | tee -a "$LOGFILE"
@@ -36,6 +32,7 @@ log() {
   echo -e "\e[32m[INFO]\e[0m $1" | tee -a "$LOGFILE"
 }
 
+# مطمئن شو که اسکریپت به‌صورت root اجرا شده
 if [ "$(id -u)" -ne 0 ]; then
   die "این اسکریپت باید با دسترسی root اجرا شود."
 fi
@@ -43,20 +40,20 @@ fi
 log "شروع اعمال تنظیمات شبکه برای low-latency و throughput..."
 
 # -----------------------------------------------------------
-# ۱. تنظیم sysctl برای cake/fq_codel و BBR و بافرها و TIME-WAIT و Keepalive
+# ۱. تنظیم sysctl
 # -----------------------------------------------------------
 declare -A sysctl_opts=(
-  # Queueing: اولویت low-latency (ترجیح cake؛ در صورت عدم وجود، fq_codel)
+  # Queueing: cake ترجیح داده می‌شود، در غیر این صورت fq_codel
   ["net.core.default_qdisc"]="cake"
   ["net.ipv4.netdev_default_qdisc"]="cake"
 
   # Congestion Control
   ["net.ipv4.tcp_congestion_control"]="bbr"
 
-  # TCP Fast Open (Client + Server)
+  # TCP Fast Open
   ["net.ipv4.tcp_fastopen"]="3"
 
-  # MTU Probing (MSS/MTU کشف خودکار)
+  # MTU Probing
   ["net.ipv4.tcp_mtu_probing"]="1"
 
   # Window Scaling
@@ -67,7 +64,7 @@ declare -A sysctl_opts=(
   ["net.ipv4.tcp_max_syn_backlog"]="2048"
   ["net.core.netdev_max_backlog"]="500000"
 
-  # Buffer sizes (Memory)
+  # Buffer sizes
   ["net.core.rmem_default"]="262144"
   ["net.core.rmem_max"]="134217728"
   ["net.core.wmem_default"]="262144"
@@ -75,9 +72,9 @@ declare -A sysctl_opts=(
   ["net.ipv4.tcp_rmem"]="4096 87380 67108864"
   ["net.ipv4.tcp_wmem"]="4096 65536 67108864"
 
-  # TIME-WAIT reuse (REUSE) و عدم استفاده از RECYCLE (برای جلوگیری از مشکلات NAT)
+  # TIME-WAIT reuse
   ["net.ipv4.tcp_tw_reuse"]="1"
-  # ["net.ipv4.tcp_tw_recycle"]="1"   # در بسیاری از سناریوها اختلال NAT ایجاد می‌کند، غیرفعال شده است.
+  # ["net.ipv4.tcp_tw_recycle"]="1"   # کامنت شده تا مشکلات NAT پیش نیاید
 
   # FIN_TIMEOUT و Keepalive
   ["net.ipv4.tcp_fin_timeout"]="15"
@@ -85,20 +82,22 @@ declare -A sysctl_opts=(
   ["net.ipv4.tcp_keepalive_intvl"]="30"
   ["net.ipv4.tcp_keepalive_probes"]="5"
 
-  # TCP No Metrics Save (پاک‌سازی history congestion پس از هر کانکشن)
+  # TCP No Metrics Save
   ["net.ipv4.tcp_no_metrics_save"]="1"
 )
 
 log "اعمال تنظیمات sysctl..."
 for key in "${!sysctl_opts[@]}"; do
   value="${sysctl_opts[$key]}"
+
+  # سعی کن مقدار را مستقیم ست کنی
   if sysctl -w "$key=$value" >/dev/null 2>&1; then
-    # اگر کلید از قبل در /etc/sysctl.conf نبود، ثبتش کن
+    # اگر در /etc/sysctl.conf وجود ندارد، ثبتش کن
     grep -qxF "$key = $value" /etc/sysctl.conf \
       || echo "$key = $value" >> /etc/sysctl.conf
     log "ثبت و اعمال شد: $key = $value"
   else
-    # اگر cake پشتیبانی نمی‌شود، از fq_codel استفاده کن
+    # فقط برای qdisc: اگر اجرای cake شکست خورد، fq_codel را امتحان کن
     if [[ "$key" == "net.core.default_qdisc" || "$key" == "net.ipv4.netdev_default_qdisc" ]]; then
       fallback="fq_codel"
       sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "نمی‌توان $key را روی $fallback تنظیم کرد"
@@ -112,7 +111,7 @@ for key in "${!sysctl_opts[@]}"; do
 done
 
 sysctl -p >/dev/null 2>&1 || die "بارگذاری مجدد sysctl با خطا مواجه شد."
-log "همه sysctlها اعمال و ذخیره شدند."
+log "همهٔ sysctlها اعمال و ذخیره شدند."
 
 # -----------------------------------------------------------
 # ۲. بارگذاری ماژول tcp_bbr
@@ -121,7 +120,7 @@ log "بارگذاری ماژول tcp_bbr..."
 if ! lsmod | grep -q '^tcp_bbr'; then
   modprobe tcp_bbr || die "بارگذاری ماژول tcp_bbr شکست خورد."
   echo "tcp_bbr" >/etc/modules-load.d/bbr.conf
-  log "tcp_bbr در حافظه بارگذاری و ثبت شد."
+  log "tcp_bbr بارگذاری و ثبت شد."
 else
   log "ماژول tcp_bbr از قبل بارگذاری شده بود."
 fi
@@ -180,13 +179,13 @@ ethtool -C "$IFACE" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 \
   || log "هشدار: coalescing پشتیبانی نشد یا تغییر یافت."
 
 # -----------------------------------------------------------
-# ۷. تخصیص IRQ affinity به یک هسته‌ی CPU (هسته‌ی #1)
+# ۷. تخصیص IRQ affinity به یک هستهٔ CPU (هستهٔ #1)
 # -----------------------------------------------------------
-log "تنظیم IRQ affinity برای $IFACE فقط روی هسته‌ی CPU#1..."
+log "تنظیم IRQ affinity برای $IFACE فقط روی هستهٔ CPU#1..."
 for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
   echo 2 > /proc/irq/"$irq"/smp_affinity \
-    && log "IRQ $irq به هسته‌ی 1 تخصیص یافت." \
-    || log "هشدار: تخصیص IRQ $irq به هسته‌ی 1 موفق نبود."
+    && log "IRQ $irq به هستهٔ 1 تخصیص یافت." \
+    || log "هشدار: تخصیص IRQ $irq به هستهٔ 1 موفق نبود."
 done
 
 # -----------------------------------------------------------
