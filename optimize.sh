@@ -1,21 +1,15 @@
 #!/bin/bash
 #
 # optimize.sh
-# اسکریپت نهایی برای اعمال تنظیماتِ هم‌زمانِ throughput و low-latency روی یک سرور لینوکسی:
+# Optimized script for throughput + low-latency networking on Linux
 #
-# • تنظیم sysctl (only net.core.default_qdisc + BBR + Fast Open + بافرها + TIME-WAIT + Keepalive)
-# • بارگذاری ماژول tcp_bbr و ثبت آن در بوت
-# • تنظیم MTU اینترفیس پیش‌فرض روی 1420 و افزودن route /24 خودکار
-# • خاموش‌سازی NIC offloadها (GRO, GSO, TSO, LRO) برای کمترین تأخیر
-# • کاهش interrupt coalescing (هر بسته فوراً interrupt تولید کند)
-# • تخصیص IRQ affinity به یک هستهٔ CPU برای ثبات بیشتر
-#
-# نحوهٔ استفاده:
-#   curl -fsSL https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh | sudo bash
-#
-# توضیحات:
-#   • اگر سرور از cake پشتیبانی نکند، خودکار fq_codel جایگزین می‌شود.
-#   • برای بازگرداندن MTU و route، به‌صورت دستی MTU را به 1500 برگردانید و route /24 را حذف کنید.
+# Features:
+#   • sysctl tuning stored in /etc/sysctl.d/99-optimize.conf
+#   • Load and persist tcp_bbr
+#   • Disable NIC offloads (GRO, GSO, TSO, LRO)
+#   • Reduce interrupt coalescing (1 interrupt per packet)
+#   • Assign NIC IRQs to CPU core #1
+#   • MTU untouched (by request)
 #
 set -o errexit
 set -o nounset
@@ -32,171 +26,117 @@ log() {
   echo -e "\e[32m[INFO]\e[0m $1" | tee -a "$LOGFILE"
 }
 
-# مطمئن شو که اسکریپت با کاربر root اجرا می‌شود
 if [ "$(id -u)" -ne 0 ]; then
-  die "این اسکریپت باید با دسترسی root اجرا شود."
+  die "This script must be run as root."
 fi
 
-log "شروع اعمال تنظیمات شبکه برای low-latency و throughput..."
+log "Starting network optimization..."
 
 # -----------------------------------------------------------
-# ۱. تنظیم sysctl برای net.core.default_qdisc و سایر پارامترها
+# 1. sysctl → stored in /etc/sysctl.d/99-optimize.conf
 # -----------------------------------------------------------
+SYSCTL_FILE="/etc/sysctl.d/99-optimize.conf"
+
 declare -A sysctl_opts=(
-  # Queueing: ترجیح cake، در صورت عدم پشتیبانی fq_codel
   ["net.core.default_qdisc"]="cake"
-
-  # Congestion Control
   ["net.ipv4.tcp_congestion_control"]="bbr"
-
-  # TCP Fast Open
   ["net.ipv4.tcp_fastopen"]="3"
-
-  # MTU Probing
   ["net.ipv4.tcp_mtu_probing"]="1"
-
-  # Window Scaling
   ["net.ipv4.tcp_window_scaling"]="1"
-
-  # Backlog / SYN Queue
   ["net.core.somaxconn"]="1024"
   ["net.ipv4.tcp_max_syn_backlog"]="2048"
   ["net.core.netdev_max_backlog"]="500000"
-
-  # Buffer sizes
   ["net.core.rmem_default"]="262144"
   ["net.core.rmem_max"]="134217728"
   ["net.core.wmem_default"]="262144"
   ["net.core.wmem_max"]="134217728"
   ["net.ipv4.tcp_rmem"]="4096 87380 67108864"
   ["net.ipv4.tcp_wmem"]="4096 65536 67108864"
-
-  # TIME-WAIT reuse
   ["net.ipv4.tcp_tw_reuse"]="1"
-  # ["net.ipv4.tcp_tw_recycle"]="1"   # غیرفعال شده تا مشکلات NAT پیش نیاید
-
-  # FIN_TIMEOUT و Keepalive
   ["net.ipv4.tcp_fin_timeout"]="15"
   ["net.ipv4.tcp_keepalive_time"]="300"
   ["net.ipv4.tcp_keepalive_intvl"]="30"
   ["net.ipv4.tcp_keepalive_probes"]="5"
-
-  # TCP No Metrics Save
   ["net.ipv4.tcp_no_metrics_save"]="1"
 )
 
-log "اعمال تنظیمات sysctl..."
+log "Writing sysctl config to $SYSCTL_FILE ..."
+: > "$SYSCTL_FILE"
 for key in "${!sysctl_opts[@]}"; do
   value="${sysctl_opts[$key]}"
-
   if sysctl -w "$key=$value" >/dev/null 2>&1; then
-    # اگر هنوز در /etc/sysctl.conf ثبت نشده، اضافه‌اش کن
-    grep -qxF "$key = $value" /etc/sysctl.conf \
-      || echo "$key = $value" >> /etc/sysctl.conf
-    log "ثبت و اعمال شد: $key = $value"
+    echo "$key = $value" >> "$SYSCTL_FILE"
+    log "Applied: $key = $value"
   else
-    # فقط برای qdisc: اگر cake ست نشد، fq_codel را امتحان کن
     if [[ "$key" == "net.core.default_qdisc" ]]; then
       fallback="fq_codel"
-      sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "نمی‌توان $key را روی $fallback تنظیم کرد"
-      grep -qxF "$key = $fallback" /etc/sysctl.conf \
-        || echo "$key = $fallback" >> /etc/sysctl.conf
-      log "برای $key، fallback روی $fallback تنظیم شد."
+      sysctl -w "$key=$fallback" >/dev/null 2>&1 || die "Failed to set $key"
+      echo "$key = $fallback" >> "$SYSCTL_FILE"
+      log "Fallback applied: $key = $fallback"
     else
-      die "شکست در تنظیم sysctl: $key=$value"
+      die "Failed to apply sysctl: $key=$value"
     fi
   fi
 done
-
-sysctl -p >/dev/null 2>&1 || die "بارگذاری مجدد sysctl با خطا مواجه شد."
-log "تمام sysctlها اعمال و ذخیره شدند."
+sysctl --system >/dev/null 2>&1
+log "Sysctl parameters applied and persisted."
 
 # -----------------------------------------------------------
-# ۲. بارگذاری ماژول tcp_bbr
+# 2. Load tcp_bbr
 # -----------------------------------------------------------
-log "بارگذاری ماژول tcp_bbr..."
+log "Loading tcp_bbr..."
 if ! lsmod | grep -q '^tcp_bbr'; then
-  modprobe tcp_bbr || die "بارگذاری ماژول tcp_bbr شکست خورد."
-  echo "tcp_bbr" >/etc/modules-load.d/bbr.conf
-  log "tcp_bbr بارگذاری و ثبت شد."
+  modprobe tcp_bbr || die "Failed to load tcp_bbr module."
+  echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+  log "tcp_bbr loaded and persisted."
 else
-  log "ماژول tcp_bbr از قبل بارگذاری شده بود."
+  log "tcp_bbr is already loaded."
 fi
 
 # -----------------------------------------------------------
-# ۳. تعیین اینترفیس پیش‌فرض و CIDR /24 خودکار
+# 3. Detect default network interface
 # -----------------------------------------------------------
-get_iface_and_cidr() {
-  local IFACE
-  IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}') \
-    || die "ناتوان در یافتن اینترفیس پیش‌فرض."
-  local IP_ADDR
-  IP_ADDR=$(ip -4 addr show "$IFACE" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1) \
-    || die "ناتوان در خواندن IP اینترفیس $IFACE."
-  local BASE
-  BASE=$(echo "$IP_ADDR" | cut -d. -f1-3)
-  local CIDR="${BASE}.0/24"
-  echo "$IFACE" "$CIDR"
+get_iface() {
+  ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}' \
+    || die "Unable to detect default interface."
 }
-
-read IFACE CIDR < <(get_iface_and_cidr)
-log "اینترفیس پیش‌فرض: $IFACE   CIDR خودکار: $CIDR"
-
-# -----------------------------------------------------------
-# ۴. تنظیم MTU روی 1420 و افزودن route خودکار
-# -----------------------------------------------------------
-current_mtu=$(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')
-if [ "$current_mtu" != "1420" ]; then
-  ip link set dev "$IFACE" mtu 1420 || die "تنظیم MTU روی 1420 برای $IFACE شکست خورد."
-  log "MTU اینترفیس $IFACE روی 1420 تنظیم شد."
-else
-  log "MTU اینترفیس $IFACE از قبل 1420 بود."
-fi
-
-if ! ip route show | grep -qw "$CIDR"; then
-  ip route add "$CIDR" dev "$IFACE" || die "افزودن route $CIDR روی $IFACE شکست خورد."
-  log "روت $CIDR به اینترفیس $IFACE اضافه شد."
-else
-  log "روت $CIDR از قبل وجود داشت."
-fi
+IFACE=$(get_iface)
+log "Default interface: $IFACE"
 
 # -----------------------------------------------------------
-# ۵. خاموش‌سازی NIC offloadها (GRO, GSO, TSO, LRO)
+# 4. Create systemd service for NIC tuning
 # -----------------------------------------------------------
-log "خاموش‌سازی NIC offloadها روی $IFACE..."
-ethtool -K "$IFACE" gro off gso off tso off lro off \
-  && log "offloadها خاموش شدند." \
-  || log "هشدار: NIC offloadها پشتیبانی نمی‌شوند یا قبلاً خاموش بودند."
+SERVICE_FILE="/etc/systemd/system/net-optimize.service"
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Network optimizations (offload, coalescing, IRQ affinity)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ethtool -K $IFACE gro off gso off tso off lro off
+ExecStart=/usr/bin/ethtool -C $IFACE rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1
+ExecStart=/bin/bash -c 'for irq in \$(grep "$IFACE" /proc/interrupts | awk -F: "{gsub(/^[ \\t]+/,\\"\\",\$1); print \$1}"); do echo 2 > /proc/irq/\$irq/smp_affinity; done'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now net-optimize.service
+log "Systemd service created and enabled for NIC tuning."
 
 # -----------------------------------------------------------
-# ۶. کاهش interrupt coalescing (هر بسته فوراً interrupt تولید کند)
+# 5. Summary
 # -----------------------------------------------------------
-log "کاهش interrupt coalescing روی $IFACE..."
-ethtool -C "$IFACE" rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1 \
-  && log "coalescing برای هر بسته روی یک interrupt تنظیم شد." \
-  || log "هشدار: coalescing پشتیبانی نشد یا تغییر یافت."
+log "All optimizations applied."
+log "Check status with:"
+log "  sysctl -a | grep qdisc"
+log "  sysctl net.ipv4.tcp_congestion_control"
+log "  ethtool -k $IFACE | grep -E 'gro|gso|tso|lro'"
+log "  ethtool -c $IFACE"
+log "  grep \"$IFACE\" /proc/interrupts"
 
-# -----------------------------------------------------------
-# ۷. تخصیص IRQ affinity به یک هستهٔ CPU (هستهٔ #1)
-# -----------------------------------------------------------
-log "تنظیم IRQ affinity برای $IFACE فقط روی هستهٔ CPU#1..."
-for irq in $(grep -R "$IFACE" /proc/interrupts | awk -F: '{print $1}'); do
-  echo 2 > /proc/irq/"$irq"/smp_affinity \
-    && log "IRQ $irq به هستهٔ 1 تخصیص یافت." \
-    || log "هشدار: تخصیص IRQ $irq به هستهٔ 1 موفق نبود."
-done
-
-# -----------------------------------------------------------
-# ۸. خلاصهٔ نهایی و توصیه‌ها
-# -----------------------------------------------------------
-log "تمام تنظیمات low-latency و throughput اعمال شدند."
-log "برای بررسی وضعیت:"
-log "  • کنترل هم‌پخشی TCP:    sysctl net.ipv4.tcp_congestion_control"
-log "  • MTU:                  ip link show $IFACE"
-log "  • Route /24:            ip route show | grep \"$CIDR\""
-log "  • offload:             ethtool -k $IFACE | grep -E 'gso|gro|tso|lro'"
-log "  • coalescing:          ethtool -c $IFACE"
-log "  • IRQ affinity:        grep \"$IFACE\" /proc/interrupts"
-
-echo -e "\n\e[34m>>> تنظیمات اعمال شد. اکنون با ping و iperf3 تست کنید.\e[0m\n"
+echo -e "\n\e[34m>>> Optimization complete. Test with ping and iperf3.\e[0m\n"
 exit 0
