@@ -1,333 +1,210 @@
 #!/usr/bin/env bash
-# net-optimize.sh — Zero-touch + UI panel + safe fallbacks
+# all-in-one linux tuning: network + system + pretty UI (English output)
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_NAME="net-optimize.sh"
-STATE_DIR="/var/lib/net-optimize"
-LOGFILE="/var/log/net-optimize.log"
-SYSCTL_FILE="/etc/sysctl.d/99-net-optimize.conf"
-SYSTEMD_UNIT_TEMPLATE="/etc/systemd/system/net-optimize@.service"
+# -------------------- Config --------------------
+MTU_DEFAULT="1420"                                  # set "" to skip changing MTU
+MTU_CRON_TAG="# mtu1420-all"
+BBR_SYSCTL="/etc/sysctl.d/10-bbr.conf"
+NET_SYSCTL="/etc/sysctl.d/15-net-basics.conf"
+VM_SYSCTL="/etc/sysctl.d/20-vm.conf"
+LIMITS_FILE="/etc/security/limits.d/99-openfiles.conf"
+THP_SERVICE="/etc/systemd/system/disable-thp.service"
+UDEV_SCHED="/etc/udev/rules.d/60-io-scheduler.rules"
 
-RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh}"
-
-# Defaults (ENV overrideable)
-ACTION="${ACTION:-dryrun}"                 # dryrun|apply|revert|status|install_service|remove_service
-PROFILE="${PROFILE:-balanced}"             # latency|balanced|throughput
-IFACE="${IFACE:-}"                         # empty = auto-detect
-MTU="${MTU:-1420}"                         # "" to keep current
-VERBOSE="${VERBOSE:-false}"
-TUNE_OFFLOADS="${TUNE_OFFLOADS:-true}"
-TUNE_COALESCE="${TUNE_COALESCE:-true}"
-PIN_IRQS="${PIN_IRQS:-false}"
-
-# Auto-apply for `curl | bash` with no args
-if [[ $# -eq 0 ]] && [[ ! -t 0 ]]; then ACTION="apply"; fi
-
-# Helpers
-log(){ $VERBOSE && echo "[INFO] $*" | tee -a "$LOGFILE" >&2; }
-warn(){ $VERBOSE && echo "[WARN] $*" | tee -a "$LOGFILE" >&2; }
-die(){ echo "[ERROR] $*" | tee -a "$LOGFILE" >&2; exit 1; }
-cmd(){ $VERBOSE && echo "+ $*" | tee -a "$LOGFILE" >&2; if [[ "$ACTION" == "apply" ]]; then eval "$@"; fi }
+# -------------------- Helpers --------------------
+ok(){ echo -e "[OK] $*"; }
+warn(){ echo -e "[WARN] $*" >&2; }
+err(){ echo -e "[ERROR] $*" >&2; }
 have(){ command -v "$1" >/dev/null 2>&1; }
-need_root(){ [[ $(id -u) -eq 0 ]] || die "باید با روت اجرا شود"; }
-p(){ echo "$*"; }
+need_root(){ [[ $(id -u) -eq 0 ]] || { err "Run as root."; exit 1; }; }
+first_iface(){ ls /sys/class/net | grep -vE '^(lo|docker|veth)' | head -n1 || true; }
 
-usage(){ cat <<EOF
-$SCRIPT_NAME [--apply|--revert|--status|--install-service|--remove-service]
-             [--profile latency|balanced|throughput] [--iface IFACE] [--mtu N]
-             [--no-offloads] [--no-coalescing] [--pin-irqs] [--verbose]
-ENV: ACTION PROFILE IFACE MTU VERBOSE TUNE_OFFLOADS TUNE_COALESCE PIN_IRQS RAW_URL
-EOF
-}
-
-parse_args(){
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --status) ACTION="status" ;;
-      --apply) ACTION="apply" ;;
-      --revert) ACTION="revert" ;;
-      --install-service) ACTION="install_service" ;;
-      --remove-service) ACTION="remove_service" ;;
-      --profile) PROFILE="${2:-}"; shift ;;
-      --iface) IFACE="${2:-}"; shift ;;
-      --mtu) MTU="${2:-}"; shift ;;
-      --no-offloads) TUNE_OFFLOADS=false ;;
-      --no-coalescing) TUNE_COALESCE=false ;;
-      --pin-irqs) PIN_IRQS=true ;;
-      --verbose) VERBOSE=true ;;
-      -h|--help) usage; exit 0 ;;
-      *) usage; exit 2 ;;
-    esac; shift
+# -------------------- MTU (runtime + cron) --------------------
+set_mtu_all(){
+  local mtu="${1:-$MTU_DEFAULT}"
+  [[ -z "$mtu" ]] && { warn "MTU change skipped (empty)."; return 0; }
+  local changed=0
+  for iface in $(ls /sys/class/net | grep -v '^lo$'); do
+    ip link set dev "$iface" mtu "$mtu" 2>/dev/null && { ok "Set MTU=$mtu on $iface"; changed=$((changed+1)); } || warn "Could not set MTU on $iface"
   done
+  (( changed > 0 )) || warn "No MTU changes were applied."
 }
 
-detect_iface(){
-  [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
-  have ip && ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1
+persist_mtu_cron(){
+  local mtu="${1:-$MTU_DEFAULT}"
+  [[ -z "$mtu" ]] && return 0
+  local line="@reboot for iface in \$(ls /sys/class/net | grep -v lo); do ip link set dev \"\$iface\" mtu $mtu; done $MTU_CRON_TAG"
+  # idempotent insert
+  ( crontab -l 2>/dev/null | grep -Fv "$MTU_CRON_TAG"; echo "$line" ) | crontab - && ok "Installed @reboot MTU=$mtu for all non-lo interfaces"
 }
 
-kernel_supports(){
-  local feat="$1"
-  case "$feat" in
-    bbr)  sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr && return 0
-          modprobe -n -v tcp_bbr >/dev/null 2>&1 && return 0; return 1 ;;
-    cake) modprobe -n -v sch_cake >/dev/null 2>&1 && return 0; return 1 ;;
-  esac
+# -------------------- BBR + net sysctls --------------------
+enable_bbr_sysctl(){
+  local qdisc="fq"
+  modprobe -n -v sch_fq >/dev/null 2>&1 || qdisc="fq_codel"
+
+  # load tcp_bbr now and persist if available
+  if modprobe -n -v tcp_bbr >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || true
+    echo "tcp_bbr" >/etc/modules-load.d/bbr.conf 2>/dev/null || true
+    ok "tcp_bbr module loaded and persisted"
+  else
+    warn "tcp_bbr module not available (will fall back to cubic if needed)"
+  fi
+
+  cat >"$BBR_SYSCTL" <<EOF
+# BBR core
+net.core.default_qdisc = ${qdisc}
+net.ipv4.tcp_congestion_control = bbr
+# safe helpers
+net.ipv4.tcp_fastopen = 1
+net.ipv4.tcp_mtu_probing = 1
+EOF
+  sysctl -p "$BBR_SYSCTL" >/dev/null 2>&1 || true
+  ok "Applied BBR sysctls (qdisc=${qdisc})"
 }
 
-ensure_bbr(){ kernel_supports bbr || return 0; [[ "$ACTION" == "apply" ]] || return 0; modprobe tcp_bbr 2>/dev/null || true; echo "tcp_bbr" >/etc/modules-load.d/bbr.conf 2>/dev/null || true; }
-ensure_cake(){ kernel_supports cake || return 0; [[ "$ACTION" == "apply" ]] || return 0; modprobe sch_cake 2>/dev/null || true; }
-
-backup_sysctls(){ mkdir -p "$STATE_DIR"; sysctl -a > "$STATE_DIR/backup-$(date +%s).conf" 2>/dev/null; }
-
-make_sysctl_payload(){
-  local qdisc="fq_codel"; kernel_supports cake && qdisc="cake"
-  local cc="bbr"; kernel_supports bbr || cc="cubic"
-  case "$PROFILE" in
-    latency)
-      cat <<SY
-net.core.default_qdisc = $qdisc
-net.ipv4.tcp_congestion_control = $cc
-net.ipv4.tcp_fastopen = 1
-net.ipv4.tcp_mtu_probing = 1
-net.core.somaxconn = 1024
-net.ipv4.tcp_max_syn_backlog = 4096
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_rmem = 4096 131072 33554432
-net.ipv4.tcp_wmem = 4096 131072 33554432
-SY
-      ;;
-    throughput)
-      cat <<SY
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
-net.ipv4.tcp_fastopen = 1
-net.ipv4.tcp_mtu_probing = 1
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 16384
-net.core.netdev_max_backlog = 65536
-net.ipv4.tcp_rmem = 4096 262144 67108864
-net.ipv4.tcp_wmem = 4096 262144 67108864
-SY
-      ;;
-    balanced|*)
-      cat <<SY
-net.core.default_qdisc = fq_codel
-net.ipv4.tcp_congestion_control = $cc
-net.ipv4.tcp_fastopen = 1
-net.ipv4.tcp_mtu_probing = 1
+apply_net_basics(){
+  cat >"$NET_SYSCTL" <<'EOF'
+# reasonable queue/backlog knobs (conservative)
 net.core.somaxconn = 2048
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_rmem = 4096 131072 33554432
-net.ipv4.tcp_wmem = 4096 131072 33554432
-SY
-      ;;
-  esac
+EOF
+  sysctl -p "$NET_SYSCTL" >/dev/null 2>&1 || true
+  ok "Applied baseline network sysctls"
 }
 
-apply_sysctl(){
-  local payload; payload=$(make_sysctl_payload)
-  backup_sysctls; ensure_bbr; ensure_cake
-  if [[ "$ACTION" == "apply" ]]; then
-    printf "%s\n" "$payload" > "$SYSCTL_FILE"
-    sysctl -p "$SYSCTL_FILE" >/dev/null
-  fi
+# -------------------- System resources --------------------
+set_ulimits(){
+  # runtime for current shell (best-effort)
+  ulimit -n 65535 2>/dev/null || true
+  # persistent for logins/services
+  cat >"$LIMITS_FILE" <<'EOF'
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+  ok "Set open files limit (nofile) to 65535 via limits.d"
 }
 
-set_mtu(){
-  local dev="$1"
-  [[ -z "${MTU:-}" ]] && return
-  [[ "$MTU" =~ ^[0-9]+$ ]] || die "MTU نامعتبر: $MTU"
-  (( MTU < 576 )) && warn "MTU خیلی کوچک است ($MTU)"
-  cmd ip link set dev "$dev" mtu "$MTU"
+set_vm_tunables(){
+  cat >"$VM_SYSCTL" <<'EOF'
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+EOF
+  sysctl -p "$VM_SYSCTL" >/dev/null 2>&1 || true
+  ok "Applied VM tunables (swappiness=10, vfs_cache_pressure=50)"
 }
 
-# ---- capability probing (to auto-disable features if NIC rejects) ----
-OFFLOADS_SUPPORTED=true
-COALESCE_SUPPORTED=true
-
-probe_offloads_support(){
-  local dev="$1"
-  have ethtool || { OFFLOADS_SUPPORTED=false; return; }
-  # if none of gro/gso/tso/lro is changeable → not supported
-  local changeable=0
-  while read -r name rest; do
-    [[ "$name" =~ ^(gro|gso|tso|lro):$ ]] || continue
-    grep -q '\[fixed\]' <<<"$rest" || changeable=$((changeable+1))
-  done < <(ethtool -k "$dev" 2>/dev/null || true)
-  (( changeable > 0 )) || OFFLOADS_SUPPORTED=false
-}
-
-probe_coalesce_support(){
-  local dev="$1"
-  have ethtool || { COALESCE_SUPPORTED=false; return; }
-  # if ethtool -c shows "n/a" or errors → not supported
-  if ! ethtool -c "$dev" >/tmp/.coalesce.$$ 2>/dev/null; then
-    COALESCE_SUPPORTED=false
-  elif grep -qE '(^rx-usecs:\s*n/a)|(^tx-usecs:\s*n/a)' /tmp/.coalesce.$$; then
-    COALESCE_SUPPORTED=false
-  fi
-  rm -f /tmp/.coalesce.$$
-}
-
-disable_offloads(){
-  $TUNE_OFFLOADS || return 0
-  $OFFLOADS_SUPPORTED || { warn "offloads پشتیبانی نمی‌شود → skip"; return 0; }
-  local dev="$1"
-  have ethtool || { warn "ethtool نیست → skip offloads"; return; }
-  local ok=true
-  for f in gro gso tso lro; do
-    if ethtool -k "$dev" 2>/dev/null | awk -v ff="$f" '$1==ff":"{print $2,$3}' | grep -vq '\[fixed\]'; then
-      if ! cmd ethtool -K "$dev" "$f" off; then ok=false; fi
-    fi
+disable_thp(){
+  # runtime
+  for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+    [[ -w "$f" ]] && echo never > "$f" 2>/dev/null || true
   done
-  $ok || warn "بعضی offloadها خاموش نشدند (اوکیه)"
-}
-
-set_coalescing(){
-  $TUNE_COALESCE || return 0
-  $COALESCE_SUPPORTED || { warn "coalescing پشتیبانی نمی‌شود → skip"; return 0; }
-  local dev="$1"
-  have ethtool || { warn "ethtool نیست → skip coalescing"; return; }
-  case "$PROFILE" in
-    latency)    cmd ethtool -C "$dev" adaptive-rx off adaptive-tx off rx-usecs 3 tx-usecs 3 || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
-    throughput) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
-    balanced|*) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  rx-usecs 20 tx-usecs 20 || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
-  esac
-}
-
-pin_irqs(){
-  $PIN_IRQS || return 0
-  local dev="$1" ncpu mask
-  ncpu=$(getconf _NPROCESSORS_ONLN || echo 1)
-  (( ncpu < 2 )) && { warn "CPU کافی برای pin IRQ نیست"; return; }
-  mask="2"
-  while read -r irq _; do
-    [[ -n "$irq" ]] || continue
-    if [[ "$ACTION" == "apply" ]]; then echo "$mask" > "/proc/irq/$irq/smp_affinity" || true; fi
-  done < <(grep -E "\b$dev\b" /proc/interrupts | awk -F: '{gsub(/^[ \t]+/,"",$1); print $1,":"}')
-}
-
-ui_panel(){
-  local dev="$1"
-  local profile="$PROFILE"
-  local qdisc cc mtu svc_active svc_enabled
-  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
-  mtu=$(ip -o link show "$dev" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
-
-  local sysctl_updated="no"; [[ -f "$SYSCTL_FILE" ]] && sysctl_updated="yes"
-  local bbr_loaded="no"; lsmod 2>/dev/null | grep -q '^tcp_bbr' && bbr_loaded="yes"
-  svc_active=$(systemctl is-active "net-optimize@${dev}.service" 2>/dev/null || echo "inactive")
-  svc_enabled=$(systemctl is-enabled "net-optimize@${dev}.service" 2>/dev/null || echo "disabled")
-
-  local gro gso tso lro rxu txu
-  if have ethtool; then
-    gro=$(ethtool -k "$dev" 2>/dev/null | awk '/\bgro:/{print $2}')
-    gso=$(ethtool -k "$dev" 2>/dev/null | awk '/\bgso:/{print $2}')
-    tso=$(ethtool -k "$dev" 2>/dev/null | awk '/\btso:/{print $2}')
-    lro=$(ethtool -k "$dev" 2>/dev/null | awk '/\blro:/{print $2}')
-    rxu=$(ethtool -c "$dev" 2>/dev/null | awk '/^rx-usecs:/{print $2}')
-    txu=$(ethtool -c "$dev" 2>/dev/null | awk '/^tx-usecs:/{print $2}')
-  else
-    gro=gso=tso=lro=rxu=txu="n/a"
-  fi
-
-  local W=66 SEP; SEP=$(printf '%*s' "$W" '' | tr ' ' '─')
-  echo "┌${SEP}┐"; printf "│ %-*s │\n" "$W" "Net Optimize Summary"; echo "├${SEP}┤"
-  printf "│ %-*s │\n" "$W" "Interface: ${dev}   Profile: ${profile}"
-  printf "│ %-*s │\n" "$W" "qdisc: ${qdisc}     CC: ${cc}"
-  printf "│ %-*s │\n" "$W" "MTU: ${mtu:-?}    Service: ${svc_active}/${svc_enabled}"
-  echo "├${SEP}┤"
-  printf "│ %-*s │\n" "$W" "Applied sysctl: ${sysctl_updated}   BBR loaded: ${bbr_loaded}"
-  printf "│ %-*s │\n" "$W" "Offloads (gro/gso/tso/lro): ${gro:-n/a}/${gso:-n/a}/${tso:-n/a}/${lro:-n/a}"
-  printf "│ %-*s │\n" "$W" "Coalescing (rx-usecs/tx-usecs): ${rxu:-n/a}/${txu:-n/a}"
-  echo "└${SEP}┘"
-}
-
-install_service(){
-  local dev="$1"
-  local BIN="/usr/local/sbin/net-optimize.sh"
-
-  # ensure script exists on disk (pipe-safe)
-  if [[ ! -f "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "bash" ]]; then
-    if have curl; then curl -fsSLo "$BIN" "$RAW_URL"
-    elif have wget; then wget -qO "$BIN" "$RAW_URL"
-    else die "curl/wget موجود نیست؛ نمی‌توان اسکریپت را در $BIN ذخیره کرد"
-    fi
-  else
-    cp -f "${BASH_SOURCE[0]}" "$BIN"
-  fi
-  chmod +x "$BIN"
-
-  # auto-probe capabilities to decide flags for ExecStart
-  probe_offloads_support "$dev"
-  probe_coalesce_support "$dev"
-  local FLAGS="--apply --profile $PROFILE --iface %I ${MTU:+--mtu $MTU}"
-  $OFFLOADS_SUPPORTED || FLAGS+=" --no-offloads"
-  $COALESCE_SUPPORTED || FLAGS+=" --no-coalescing"
-  $PIN_IRQS && FLAGS+=" --pin-irqs"
-
-  cat >"$SYSTEMD_UNIT_TEMPLATE" <<SERV
+  # persistent service
+  cat >"$THP_SERVICE" <<'EOF'
 [Unit]
-Description=Network optimizations for %I (safe)
-After=network-online.target
-Wants=network-online.target
-ConditionPathExists=/sys/class/net/%I
+Description=Disable Transparent Huge Pages (THP)
+After=multi-user.target
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
-ExecStart=$BIN $FLAGS
+ExecStart=/usr/bin/env bash -c 'for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do [[ -w "$f" ]] && echo never > "$f" || true; done'
 
 [Install]
 WantedBy=multi-user.target
-SERV
-
-  if [[ "$ACTION" == "apply" ]]; then
-    systemctl daemon-reload
-    systemctl enable --now "net-optimize@${dev}.service"
-  fi
-}
-
-remove_service(){
-  local dev="$1"
-  systemctl disable --now "net-optimize@${dev}.service" 2>/dev/null || true
-  rm -f "$SYSTEMD_UNIT_TEMPLATE"
+EOF
   systemctl daemon-reload
+  systemctl enable --now disable-thp.service >/dev/null 2>&1 || true
+  ok "Disabled THP (runtime + systemd service)"
 }
 
-main(){
-  parse_args "$@"; need_root
-  IFACE="$(detect_iface)"; [[ -z "$IFACE" ]] && die "iface پیدا نشد"
+install_io_scheduler_udev(){
+  # sets mq-deadline for non-rotational devices at boot (if available)
+  cat >"$UDEV_SCHED" <<'EOF'
+ACTION=="add|change", KERNEL=="sd*[!0-9]", ATTR{queue/rotational}=="0", TEST=="queue/scheduler", RUN+="/usr/bin/bash -c 'if grep -qw mq-deadline /sys/block/%k/queue/scheduler; then echo mq-deadline > /sys/block/%k/queue/scheduler; fi'"
+EOF
+  # apply now (best-effort)
+  for d in /sys/block/*; do
+    [[ -f "$d/queue/rotational" ]] || continue
+    if [[ "$(cat "$d/queue/rotational")" -eq 0 ]] && [[ -w "$d/queue/scheduler" ]] && grep -qw mq-deadline "$d/queue/scheduler"; then
+      echo mq-deadline > "$d/queue/scheduler" 2>/dev/null || true
+    fi
+  done
+  udevadm control --reload >/dev/null 2>&1 || true
+  ok "Configured I/O scheduler (mq-deadline for SSD where supported)"
+}
 
-  case "$ACTION" in
-    dryrun)
-      p "[Dry-run] Would apply profile=$PROFILE mtu=${MTU:-keep} iface=$IFACE"
-      ui_panel "$IFACE"
-      ;;
-    apply)
-      p "[1/4] sysctl tuning …"; apply_sysctl
-      p "[2/4] set MTU …"; set_mtu "$IFACE"
-      # probe + apply NIC features safely
-      probe_offloads_support "$IFACE"; probe_coalesce_support "$IFACE"
-      $TUNE_OFFLOADS && disable_offloads "$IFACE"
-      $TUNE_COALESCE && set_coalescing "$IFACE"
-      p "[4/4] install service …"; install_service "$IFACE"
-      echo "✅ Done."; ui_panel "$IFACE"
-      ;;
-    status) ui_panel "$IFACE" ;;
-    revert)
-      rm -f "$SYSCTL_FILE"; sysctl --system >/dev/null
-      systemctl disable --now "net-optimize@${IFACE}.service" 2>/dev/null || true
-      echo "Reverted sysctl (and disabled service if present)."; ui_panel "$IFACE"
-      ;;
-    install_service) install_service "$IFACE" ;;
-    remove_service)  remove_service "$IFACE" ;;
-    *) usage; exit 2 ;;
-  esac
+# -------------------- UI Panel --------------------
+ui_panel(){
+  local iface="$(first_iface)"
+  local qdisc cc swp vfs thp
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  swp=$(sysctl -n vm.swappiness 2>/dev/null || echo "?")
+  vfs=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "?")
+  thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | sed -E 's/.*\[(.*)\].*/\1/' || echo "?")
+
+  # gather MTUs
+  local MTU_LINES=""
+  for i in $(ls /sys/class/net | grep -v '^lo$'); do
+    local m; m=$(ip -o link show "$i" 2>/dev/null | awk '{for(j=1;j<=NF;j++) if($j=="mtu") print $(j+1)}')
+    MTU_LINES+="$i: ${m:-?}   "
+  done
+
+  # gather IO sched
+  local IOS=""
+  for d in /sys/block/*; do
+    [[ -f "$d/queue/scheduler" ]] || continue
+    local name sched; name=$(basename "$d"); sched=$(tr -d '[]' < "$d/queue/scheduler")
+    IOS+="$name: $sched   "
+  done
+
+  local W=74; local SEP; SEP=$(printf '%*s' "$W" '' | tr ' ' '─')
+  echo "┌${SEP}┐"
+  printf "│ %-*s │\n" "$W" "Linux Optimize Summary"
+  echo "├${SEP}┤"
+  printf "│ %-*s │\n" "$W" "Network"
+  printf "│ %-*s │\n" "$W" "  qdisc=$qdisc   cc=$cc"
+  printf "│ %-*s │\n" "$W" "  MTUs: $MTU_LINES"
+  echo "├${SEP}┤"
+  printf "│ %-*s │\n" "$W" "System"
+  printf "│ %-*s │\n" "$W" "  swappiness=$swp   vfs_cache_pressure=$vfs   THP=$thp"
+  printf "│ %-*s │\n" "$W" "  nofile target: 65535 (limits.d)"
+  printf "│ %-*s │\n" "$W" "  IO sched: $IOS"
+  echo "└${SEP}┘"
+}
+
+# -------------------- Main --------------------
+main(){
+  need_root
+
+  echo "[1/6] Set MTU for all interfaces …"
+  set_mtu_all "$MTU_DEFAULT"
+  persist_mtu_cron "$MTU_DEFAULT"
+
+  echo "[2/6] Enable BBR + net qdisc …"
+  enable_bbr_sysctl
+  apply_net_basics
+
+  echo "[3/6] Set process/file limits …"
+  set_ulimits
+
+  echo "[4/6] Apply VM tunables …"
+  set_vm_tunables
+
+  echo "[5/6] Disable THP …"
+  disable_thp
+
+  echo "[6/6] Configure IO scheduler …"
+  install_io_scheduler_udev
+
+  echo "✅ Done. Summary:"
+  ui_panel
 }
 
 main "$@"
