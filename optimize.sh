@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# net-optimize.sh — Zero-touch + concise UI + safe & reversible
-# زبان: فارسی + Bash
-
+# net-optimize.sh — Zero-touch + concise UI + safe & reversible (FA)
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -11,20 +9,20 @@ LOGFILE="/var/log/net-optimize.log"
 SYSCTL_FILE="/etc/sysctl.d/99-net-optimize.conf"
 SYSTEMD_UNIT_TEMPLATE="/etc/systemd/system/net-optimize@.service"
 
-# این URL را اگر جای ریپو عوض شد به‌روز کن
-RAW_URL="https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh"
+# حتماً اگر مسیر ریپو عوض شد این URL را بروز کن
+RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh}"
 
-# ===== Defaults (قابل override با ENV) =====
+# ===== Defaults (override via ENV) =====
 ACTION="${ACTION:-dryrun}"                 # dryrun|apply|revert|status|install_service|remove_service
 PROFILE="${PROFILE:-balanced}"             # latency|balanced|throughput
-IFACE="${IFACE:-}"                         # خالی = auto-detect
-MTU="${MTU:-1420}"                         # 1420 پیش‌فرض؛ اگر نمی‌خوای تغییر کند: MTU=""
+IFACE="${IFACE:-}"                         # empty = auto-detect
+MTU="${MTU:-1420}"                         # 1420 default; set MTU="" to keep current
 VERBOSE="${VERBOSE:-false}"
 TUNE_OFFLOADS="${TUNE_OFFLOADS:-true}"
 TUNE_COALESCE="${TUNE_COALESCE:-true}"
 PIN_IRQS="${PIN_IRQS:-false}"
 
-# اگر بدون آرگومان و از طریق pipe اجرا شد → auto-apply
+# Auto-apply when run via pipe with no args: curl ... | sudo bash
 if [[ $# -eq 0 ]] && [[ ! -t 0 ]]; then ACTION="apply"; fi
 
 # ===== Helpers =====
@@ -40,7 +38,7 @@ usage(){ cat <<EOF
 $SCRIPT_NAME [--apply|--revert|--status|--install-service|--remove-service]
              [--profile latency|balanced|throughput] [--iface IFACE] [--mtu N]
              [--no-offloads] [--no-coalescing] [--pin-irqs] [--verbose]
-ENV: ACTION PROFILE IFACE MTU VERBOSE TUNE_OFFLOADS TUNE_COALESCE PIN_IRQS
+ENV: ACTION PROFILE IFACE MTU VERBOSE TUNE_OFFLOADS TUNE_COALESCE PIN_IRQS RAW_URL
 EOF
 }
 
@@ -235,7 +233,7 @@ install_service(){
   local BIN="/usr/local/sbin/net-optimize.sh"
 
   # اگر از pipe اجرا شده یا $0 فایل نیست → از GitHub بکش
-  if [[ ! -f "$0" || "$0" == "bash" ]]; then
+  if [[ ! -f "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "bash" ]]; then
     if have curl; then
       curl -fsSLo "$BIN" "$RAW_URL"
     elif have wget; then
@@ -244,7 +242,7 @@ install_service(){
       die "curl/wget موجود نیست؛ نمی‌توان اسکریپت را در $BIN ذخیره کرد"
     fi
   else
-    cp -f "$0" "$BIN"
+    cp -f "${BASH_SOURCE[0]}" "$BIN"
   fi
   chmod +x "$BIN"
 
