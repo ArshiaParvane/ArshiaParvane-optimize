@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
-# net-optimize.sh — zero-touch on pipe, concise UX
+# net-optimize.sh — Zero‑touch, concise UI, safe & reversible
+# زبان: فارسی + Bash. هدف: مشتری فقط یک دستور بزند و خلاصهٔ تمیز ببیند.
+#
+# ویژگی‌ها
+#  - اگر بدون آرگومان و از طریق pipe اجرا شود (curl | bash) → خودش با defaults امن «apply» می‌کند
+#  - پروفایل‌ها: latency | balanced | throughput (پیش‌فرض: balanced)
+#  - BBR/CAKE در صورت پشتیبانی هسته لود و پایدار می‌شوند
+#  - MTU اختیاری (پیش‌فرض 1420؛ برای تونل‌ها خوب است). اگر نخواهید دست بخورد، MTU=""
+#  - سرویس systemd قالب‌دار net-optimize@<iface>.service برای پایداری بعد از ریبوت
+#  - خروجی UI‑panel شکیل که خلاصهٔ کارهای انجام‌شده را نشان می‌دهد
+#  - حالت verbose برای دیباگ
+#
 set -Eeuo pipefail
-IFS=$'\n\t'
+IFS=$'
+	'
 
 SCRIPT_NAME="net-optimize.sh"
 STATE_DIR="/var/lib/net-optimize"
@@ -9,31 +21,33 @@ LOGFILE="/var/log/net-optimize.log"
 SYSCTL_FILE="/etc/sysctl.d/99-net-optimize.conf"
 SYSTEMD_UNIT_TEMPLATE="/etc/systemd/system/net-optimize@.service"
 
-# ===== Defaults (overridable by env) =====
-ACTION="${ACTION:-dryrun}"                # dryrun|apply|revert|status|install_service|remove_service
-PROFILE="${PROFILE:-balanced}"            # latency|balanced|throughput
-IFACE="${IFACE:-}"                        # empty = auto-detect
-MTU="${MTU:-1420}"                        # set 1420 by default for tunnels; set empty to keep
+# ===== Defaults (قابل override با ENV) =====
+ACTION="${ACTION:-dryrun}"                 # dryrun|apply|revert|status|install_service|remove_service
+PROFILE="${PROFILE:-balanced}"             # latency|balanced|throughput
+IFACE="${IFACE:-}"                          # خالی = auto-detect
+MTU="${MTU:-1420}"                          # 1420 پیش‌فرض؛ برای no-change، خالی بگذارید
 VERBOSE="${VERBOSE:-false}"
+TUNE_OFFLOADS="${TUNE_OFFLOADS:-true}"
+TUNE_COALESCE="${TUNE_COALESCE:-true}"
+PIN_IRQS="${PIN_IRQS:-false}"
 
-# If no args and stdin is NOT a TTY (i.e., `curl | bash`), auto-apply with safe defaults
-if [[ $# -eq 0 ]] && [[ ! -t 0 ]]; then
-  ACTION="apply"
-fi
+# Auto-apply روی pipe بدون آرگومان
+if [[ $# -eq 0 ]] && [[ ! -t 0 ]]; then ACTION="apply"; fi
 
 # ===== Helpers =====
 log(){ $VERBOSE && echo "[INFO] $*" | tee -a "$LOGFILE" >&2; }
 warn(){ $VERBOSE && echo "[WARN] $*" | tee -a "$LOGFILE" >&2; }
 die(){ echo "[ERROR] $*" | tee -a "$LOGFILE" >&2; exit 1; }
 cmd(){ $VERBOSE && echo "+ $*" | tee -a "$LOGFILE" >&2; if [[ "$ACTION" == "apply" ]]; then eval "$@"; fi }
-need_root(){ [[ $(id -u) -eq 0 ]] || die "باید با روت اجرا شود"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
+need_root(){ [[ $(id -u) -eq 0 ]] || die "باید با روت اجرا شود"; }
 p(){ echo "$*"; }
 
 usage(){ cat <<EOF
 $SCRIPT_NAME [--apply|--revert|--status|--install-service|--remove-service]
-             [--profile latency|balanced|throughput] [--iface IFACE] [--mtu N] [--verbose]
-ENV overrides: ACTION, PROFILE, IFACE, MTU, VERBOSE
+             [--profile latency|balanced|throughput] [--iface IFACE] [--mtu N]
+             [--no-offloads] [--no-coalescing] [--pin-irqs] [--verbose]
+ENV overrides: ACTION, PROFILE, IFACE, MTU, VERBOSE, TUNE_OFFLOADS, TUNE_COALESCE, PIN_IRQS
 EOF
 }
 
@@ -48,13 +62,17 @@ parse_args(){
       --profile) PROFILE="${2:-}"; shift ;;
       --iface) IFACE="${2:-}"; shift ;;
       --mtu) MTU="${2:-}"; shift ;;
+      --no-offloads) TUNE_OFFLOADS=false ;;
+      --no-coalescing) TUNE_COALESCE=false ;;
+      --pin-irqs) PIN_IRQS=true ;;
       --verbose) VERBOSE=true ;;
       -h|--help) usage; exit 0 ;;
       *) usage; exit 2 ;;
-    esac
-    shift
+    esac; shift
   done
 }
+
+# ===== Detection =====
 
 detect_iface(){
   [[ -n "$IFACE" ]] && { echo "$IFACE"; return; }
@@ -83,17 +101,53 @@ ensure_cake(){
   modprobe sch_cake 2>/dev/null || true
 }
 
+# ===== Sysctl =====
 backup_sysctls(){ mkdir -p "$STATE_DIR"; sysctl -a > "$STATE_DIR/backup-$(date +%s).conf" 2>/dev/null; }
 
 make_sysctl_payload(){
   local qdisc="fq_codel"; kernel_supports cake && qdisc="cake"
   local cc="bbr"; kernel_supports bbr || cc="cubic"
-  cat <<SY
+  case "$PROFILE" in
+    latency)
+      cat <<SY
 net.core.default_qdisc = $qdisc
 net.ipv4.tcp_congestion_control = $cc
 net.ipv4.tcp_fastopen = 1
 net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = 1024
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 131072 33554432
 SY
+      ;;
+    throughput)
+      cat <<SY
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = $cc
+net.ipv4.tcp_fastopen = 1
+net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 16384
+net.core.netdev_max_backlog = 65536
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
+SY
+      ;;
+    balanced|*)
+      cat <<SY
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = $cc
+net.ipv4.tcp_fastopen = 1
+net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = 2048
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 131072 33554432
+SY
+      ;;
+  esac
 }
 
 apply_sysctl(){
@@ -101,11 +155,13 @@ apply_sysctl(){
   backup_sysctls
   ensure_bbr; ensure_cake
   if [[ "$ACTION" == "apply" ]]; then
-    printf "%s\n" "$payload" > "$SYSCTL_FILE"
+    printf "%s
+" "$payload" > "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" >/dev/null
   fi
 }
 
+# ===== NIC tuning =====
 set_mtu(){
   local dev="$1"
   [[ -z "${MTU:-}" ]] && return
@@ -114,17 +170,87 @@ set_mtu(){
   cmd ip link set dev "$dev" mtu "$MTU"
 }
 
-status_summary(){
+disable_offloads(){
+  $TUNE_OFFLOADS || return 0
+  local dev="$1"; have ethtool || { warn "ethtool نیست؛ offloads رد شد"; return; }
+  for f in gro gso tso lro; do
+    if ethtool -k "$dev" 2>/dev/null | awk -v ff="$f" '$1==ff":"{print $2,$3}' | grep -vq '\[fixed\]'; then
+      cmd ethtool -K "$dev" "$f" off || warn "خاموش کردن $f نشد"
+    fi
+  done
+}
+
+set_coalescing(){
+  $TUNE_COALESCE || return 0
+  local dev="$1"; have ethtool || { warn "ethtool نیست؛ coalescing رد شد"; return; }
+  case "$PROFILE" in
+    latency)    cmd ethtool -C "$dev" adaptive-rx off adaptive-tx off rx-usecs 3 tx-usecs 3 || true ;;
+    throughput) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  || true ;;
+    balanced|*) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  rx-usecs 20 tx-usecs 20 || true ;;
+  esac
+}
+
+pin_irqs(){
+  $PIN_IRQS || return 0
+  local dev="$1" ncpu mask
+  ncpu=$(getconf _NPROCESSORS_ONLN || echo 1)
+  (( ncpu < 2 )) && { warn "CPU کافی برای pin IRQ نیست"; return; }
+  mask="2"
+  while read -r irq _; do
+    [[ -n "$irq" ]] || continue
+    if [[ "$ACTION" == "apply" ]]; then echo "$mask" > "/proc/irq/$irq/smp_affinity" || true; fi
+  done < <(grep -E "$dev" /proc/interrupts | awk -F: '{gsub(/^[ 	]+/,"",$1); print $1,":"}')
+}
+
+# ===== UI Panel =====
+ui_panel(){
   local dev="$1"
+  local profile="$PROFILE"
   local qdisc cc mtu svc_active svc_enabled
   qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   mtu=$(ip -o link show "$dev" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
+
+  local sysctl_updated="no"; [[ -f "$SYSCTL_FILE" ]] && sysctl_updated="yes"
+  local bbr_loaded="no"; lsmod 2>/dev/null | grep -q '^tcp_bbr' && bbr_loaded="yes"
   svc_active=$(systemctl is-active "net-optimize@${dev}.service" 2>/dev/null || echo "inactive")
   svc_enabled=$(systemctl is-enabled "net-optimize@${dev}.service" 2>/dev/null || echo "disabled")
-  echo "qdisc: $qdisc | cc: $cc | mtu($dev): ${mtu:-?} | service: ${svc_active}/${svc_enabled}"
+
+  local gro gso tso lro rxu txu
+  if have ethtool; then
+    gro=$(ethtool -k "$dev" 2>/dev/null | awk '/gro:/{print $2}')
+    gso=$(ethtool -k "$dev" 2>/dev/null | awk '/gso:/{print $2}')
+    tso=$(ethtool -k "$dev" 2>/dev/null | awk '/tso:/{print $2}')
+    lro=$(ethtool -k "$dev" 2>/dev/null | awk '/lro:/{print $2}')
+    rxu=$(ethtool -c "$dev" 2>/dev/null | awk '/^rx-usecs:/{print $2}')
+    txu=$(ethtool -c "$dev" 2>/dev/null | awk '/^tx-usecs:/{print $2}')
+  else
+    gro=gso=tso=lro=rxu=txu="n/a"
+  fi
+
+  local W=66 SEP
+  SEP=$(printf '%*s' "$W" '' | tr ' ' '─')
+  echo "┌${SEP}┐"
+  printf "│ %-*s │
+" "$W" "Net Optimize Summary"
+  echo "├${SEP}┤"
+  printf "│ %-*s │
+" "$W" "Interface: ${dev}   Profile: ${profile}"
+  printf "│ %-*s │
+" "$W" "qdisc: ${qdisc}     CC: ${cc}"
+  printf "│ %-*s │
+" "$W" "MTU: ${mtu:-?}    Service: ${svc_active}/${svc_enabled}"
+  echo "├${SEP}┤"
+  printf "│ %-*s │
+" "$W" "Applied sysctl: ${sysctl_updated}   BBR loaded: ${bbr_loaded}"
+  printf "│ %-*s │
+" "$W" "Offloads (gro/gso/tso/lro): ${gro:-n/a}/${gso:-n/a}/${tso:-n/a}/${lro:-n/a}"
+  printf "│ %-*s │
+" "$W" "Coalescing (rx-usecs/tx-usecs): ${rxu:-n/a}/${txu:-n/a}"
+  echo "└${SEP}┘"
 }
 
+# ===== systemd =====
 install_service(){
   local dev="$1"
   local BIN="/usr/local/sbin/net-optimize.sh"
@@ -138,7 +264,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$BIN --apply --profile $PROFILE --iface %I ${MTU:+--mtu $MTU}
+ExecStart=$BIN --apply --profile $PROFILE --iface %I ${MTU:+--mtu $MTU} ${TUNE_OFFLOADS:+} ${TUNE_COALESCE:+} ${PIN_IRQS:+--pin-irqs}
 
 [Install]
 WantedBy=multi-user.target
@@ -156,6 +282,7 @@ remove_service(){
   systemctl daemon-reload
 }
 
+# ===== Main =====
 main(){
   parse_args "$@"
   need_root
@@ -164,21 +291,27 @@ main(){
   case "$ACTION" in
     dryrun)
       p "[Dry-run] Would apply profile=$PROFILE mtu=${MTU:-keep} iface=$IFACE"
+      ui_panel "$IFACE"
       ;;
     apply)
-      p "[1/3] sysctl tuning …"; apply_sysctl
-      p "[2/3] set MTU …"; set_mtu "$IFACE"
-      p "[3/3] install service …"; install_service "$IFACE"
-      echo "✅ Done."; status_summary "$IFACE"
+      p "[1/4] sysctl tuning …"; apply_sysctl
+      p "[2/4] set MTU …"; set_mtu "$IFACE"
+      p "[3/4] NIC features …"; disable_offloads "$IFACE"; set_coalescing "$IFACE"; $PIN_IRQS && { p "[opt] pin IRQs"; pin_irqs "$IFACE"; }
+      p "[4/4] install service …"; install_service "$IFACE"
+      echo "✅ Done."; ui_panel "$IFACE"
       ;;
-    status) status_summary "$IFACE" ;;
+    status)
+      ui_panel "$IFACE" ;;
     revert)
       rm -f "$SYSCTL_FILE"; sysctl --system >/dev/null
       systemctl disable --now "net-optimize@${IFACE}.service" 2>/dev/null || true
       echo "Reverted sysctl (and disabled service if present)."
+      ui_panel "$IFACE"
       ;;
-    install_service) install_service "$IFACE" ;;
-    remove_service)  remove_service "$IFACE" ;;
+    install_service)
+      install_service "$IFACE" ;;
+    remove_service)
+      remove_service "$IFACE" ;;
     *) usage; exit 2 ;;
   esac
 }
