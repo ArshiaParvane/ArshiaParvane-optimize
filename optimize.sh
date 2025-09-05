@@ -37,6 +37,7 @@ SYSTEMD_UNIT_TEMPLATE="/etc/systemd/system/net-optimize@.service"
 ACTION="dryrun"        # dryrun|apply|revert|status|install_service|remove_service
 PROFILE="balanced"     # latency|balanced|throughput
 IFACE=""
+MTU=""                 # empty = don't touch. e.g., 1420 to set MTU
 TUNE_COALESCING=true
 TUNE_OFFLOADS=true
 PIN_IRQS=false
@@ -80,6 +81,7 @@ parse_args(){
       --remove-service) ACTION="remove_service" ; shift ;;
       --profile) PROFILE="${2:-}"; shift 2 ;;
       --iface) IFACE="${2:-}"; shift 2 ;;
+      --mtu) MTU="${2:-}"; shift 2 ;;
       --no-coalescing) TUNE_COALESCING=false; shift ;;
       --no-offloads)   TUNE_OFFLOADS=false; shift ;;
       --pin-irqs) PIN_IRQS=true; shift ;;
@@ -247,6 +249,27 @@ revert_sysctl(){
 
 # --------------------------- NIC Tuning ---------------------------
 
+set_mtu(){
+  local dev="$1"
+  [[ -z "$MTU" ]] && return 0
+  if ! [[ "$MTU" =~ ^[0-9]+$ ]]; then die "MTU نامعتبر: $MTU"; fi
+  if (( MTU < 576 )); then warn "MTU بسیار کوچک است ($MTU)"; fi
+  local cur
+  cur=$(ip -o link show "$dev" | awk '{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
+  if [[ "$cur" == "$MTU" ]]; then
+    log "MTU $dev از قبل $MTU است."
+    return 0
+  fi
+  log "تنظیم MTU ${dev} → ${MTU}"
+  if [[ "$ACTION" == "apply" ]]; then
+    ip link set dev "$dev" mtu "$MTU" || die "تنظیم MTU شکست خورد"
+  else
+    echo "+ ip link set dev $dev mtu $MTU" | tee -a "$LOGFILE" >&2
+  fi
+}
+
+
+
 disable_offloads(){
   local dev="$1"; have ethtool || { warn "ethtool پیدا نشد؛ از خاموش کردن offload صرف‌نظر می‌شود"; return; }
   log "خاموش‌کردن offloads (درصورت امکان) روی $dev"
@@ -348,12 +371,14 @@ main(){
     dryrun)
       log "پیش‌نمایش: هیچ تغییری اعمال نخواهد شد. برای اعمال از --apply استفاده کنید."
       apply_sysctl   # prints payload
+      set_mtu "$IFACE"
       $TUNE_OFFLOADS && disable_offloads "$IFACE"
       $TUNE_COALESCING && set_coalescing "$IFACE"
       $PIN_IRQS && pin_irqs "$IFACE"
       status_report "$IFACE" ;;
     apply)
       apply_sysctl
+      set_mtu "$IFACE"
       $TUNE_OFFLOADS && disable_offloads "$IFACE"
       $TUNE_COALESCING && set_coalescing "$IFACE"
       $PIN_IRQS && pin_irqs "$IFACE"
