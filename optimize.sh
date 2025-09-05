@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# net-optimize.sh — Zero-touch + concise UI + safe & reversible (FA)
+# net-optimize.sh — Zero-touch + UI panel + safe fallbacks
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -9,23 +9,22 @@ LOGFILE="/var/log/net-optimize.log"
 SYSCTL_FILE="/etc/sysctl.d/99-net-optimize.conf"
 SYSTEMD_UNIT_TEMPLATE="/etc/systemd/system/net-optimize@.service"
 
-# حتماً اگر مسیر ریپو عوض شد این URL را بروز کن
 RAW_URL="${RAW_URL:-https://raw.githubusercontent.com/ArshiaParvane/ArshiaParvane-optimize/main/optimize.sh}"
 
-# ===== Defaults (override via ENV) =====
+# Defaults (ENV overrideable)
 ACTION="${ACTION:-dryrun}"                 # dryrun|apply|revert|status|install_service|remove_service
 PROFILE="${PROFILE:-balanced}"             # latency|balanced|throughput
 IFACE="${IFACE:-}"                         # empty = auto-detect
-MTU="${MTU:-1420}"                         # 1420 default; set MTU="" to keep current
+MTU="${MTU:-1420}"                         # "" to keep current
 VERBOSE="${VERBOSE:-false}"
 TUNE_OFFLOADS="${TUNE_OFFLOADS:-true}"
 TUNE_COALESCE="${TUNE_COALESCE:-true}"
 PIN_IRQS="${PIN_IRQS:-false}"
 
-# Auto-apply when run via pipe with no args: curl ... | sudo bash
+# Auto-apply for `curl | bash` with no args
 if [[ $# -eq 0 ]] && [[ ! -t 0 ]]; then ACTION="apply"; fi
 
-# ===== Helpers =====
+# Helpers
 log(){ $VERBOSE && echo "[INFO] $*" | tee -a "$LOGFILE" >&2; }
 warn(){ $VERBOSE && echo "[WARN] $*" | tee -a "$LOGFILE" >&2; }
 die(){ echo "[ERROR] $*" | tee -a "$LOGFILE" >&2; exit 1; }
@@ -77,18 +76,8 @@ kernel_supports(){
   esac
 }
 
-ensure_bbr(){
-  kernel_supports bbr || return 0
-  [[ "$ACTION" == "apply" ]] || return 0
-  modprobe tcp_bbr 2>/dev/null || true
-  echo "tcp_bbr" >/etc/modules-load.d/bbr.conf 2>/dev/null || true
-}
-
-ensure_cake(){
-  kernel_supports cake || return 0
-  [[ "$ACTION" == "apply" ]] || return 0
-  modprobe sch_cake 2>/dev/null || true
-}
+ensure_bbr(){ kernel_supports bbr || return 0; [[ "$ACTION" == "apply" ]] || return 0; modprobe tcp_bbr 2>/dev/null || true; echo "tcp_bbr" >/etc/modules-load.d/bbr.conf 2>/dev/null || true; }
+ensure_cake(){ kernel_supports cake || return 0; [[ "$ACTION" == "apply" ]] || return 0; modprobe sch_cake 2>/dev/null || true; }
 
 backup_sysctls(){ mkdir -p "$STATE_DIR"; sysctl -a > "$STATE_DIR/backup-$(date +%s).conf" 2>/dev/null; }
 
@@ -140,8 +129,7 @@ SY
 
 apply_sysctl(){
   local payload; payload=$(make_sysctl_payload)
-  backup_sysctls
-  ensure_bbr; ensure_cake
+  backup_sysctls; ensure_bbr; ensure_cake
   if [[ "$ACTION" == "apply" ]]; then
     printf "%s\n" "$payload" > "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" >/dev/null
@@ -151,28 +139,62 @@ apply_sysctl(){
 set_mtu(){
   local dev="$1"
   [[ -z "${MTU:-}" ]] && return
-  if ! [[ "$MTU" =~ ^[0-9]+$ ]]; then die "MTU نامعتبر: $MTU"; fi
+  [[ "$MTU" =~ ^[0-9]+$ ]] || die "MTU نامعتبر: $MTU"
   (( MTU < 576 )) && warn "MTU خیلی کوچک است ($MTU)"
   cmd ip link set dev "$dev" mtu "$MTU"
 }
 
+# ---- capability probing (to auto-disable features if NIC rejects) ----
+OFFLOADS_SUPPORTED=true
+COALESCE_SUPPORTED=true
+
+probe_offloads_support(){
+  local dev="$1"
+  have ethtool || { OFFLOADS_SUPPORTED=false; return; }
+  # if none of gro/gso/tso/lro is changeable → not supported
+  local changeable=0
+  while read -r name rest; do
+    [[ "$name" =~ ^(gro|gso|tso|lro):$ ]] || continue
+    grep -q '\[fixed\]' <<<"$rest" || changeable=$((changeable+1))
+  done < <(ethtool -k "$dev" 2>/dev/null || true)
+  (( changeable > 0 )) || OFFLOADS_SUPPORTED=false
+}
+
+probe_coalesce_support(){
+  local dev="$1"
+  have ethtool || { COALESCE_SUPPORTED=false; return; }
+  # if ethtool -c shows "n/a" or errors → not supported
+  if ! ethtool -c "$dev" >/tmp/.coalesce.$$ 2>/dev/null; then
+    COALESCE_SUPPORTED=false
+  elif grep -qE '(^rx-usecs:\s*n/a)|(^tx-usecs:\s*n/a)' /tmp/.coalesce.$$; then
+    COALESCE_SUPPORTED=false
+  fi
+  rm -f /tmp/.coalesce.$$
+}
+
 disable_offloads(){
   $TUNE_OFFLOADS || return 0
-  local dev="$1"; have ethtool || { warn "ethtool نیست؛ offloads رد شد"; return; }
+  $OFFLOADS_SUPPORTED || { warn "offloads پشتیبانی نمی‌شود → skip"; return 0; }
+  local dev="$1"
+  have ethtool || { warn "ethtool نیست → skip offloads"; return; }
+  local ok=true
   for f in gro gso tso lro; do
     if ethtool -k "$dev" 2>/dev/null | awk -v ff="$f" '$1==ff":"{print $2,$3}' | grep -vq '\[fixed\]'; then
-      cmd ethtool -K "$dev" "$f" off || warn "خاموش کردن $f نشد"
+      if ! cmd ethtool -K "$dev" "$f" off; then ok=false; fi
     fi
   done
+  $ok || warn "بعضی offloadها خاموش نشدند (اوکیه)"
 }
 
 set_coalescing(){
   $TUNE_COALESCE || return 0
-  local dev="$1"; have ethtool || { warn "ethtool نیست؛ coalescing رد شد"; return; }
+  $COALESCE_SUPPORTED || { warn "coalescing پشتیبانی نمی‌شود → skip"; return 0; }
+  local dev="$1"
+  have ethtool || { warn "ethtool نیست → skip coalescing"; return; }
   case "$PROFILE" in
-    latency)    cmd ethtool -C "$dev" adaptive-rx off adaptive-tx off rx-usecs 3 tx-usecs 3 || true ;;
-    throughput) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  || true ;;
-    balanced|*) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  rx-usecs 20 tx-usecs 20 || true ;;
+    latency)    cmd ethtool -C "$dev" adaptive-rx off adaptive-tx off rx-usecs 3 tx-usecs 3 || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
+    throughput) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
+    balanced|*) cmd ethtool -C "$dev" adaptive-rx on  adaptive-tx on  rx-usecs 20 tx-usecs 20 || { COALESCE_SUPPORTED=false; warn "coalescing رد شد → skip next time"; } ;;
   esac
 }
 
@@ -213,11 +235,8 @@ ui_panel(){
     gro=gso=tso=lro=rxu=txu="n/a"
   fi
 
-  local W=66 SEP
-  SEP=$(printf '%*s' "$W" '' | tr ' ' '─')
-  echo "┌${SEP}┐"
-  printf "│ %-*s │\n" "$W" "Net Optimize Summary"
-  echo "├${SEP}┤"
+  local W=66 SEP; SEP=$(printf '%*s' "$W" '' | tr ' ' '─')
+  echo "┌${SEP}┐"; printf "│ %-*s │\n" "$W" "Net Optimize Summary"; echo "├${SEP}┤"
   printf "│ %-*s │\n" "$W" "Interface: ${dev}   Profile: ${profile}"
   printf "│ %-*s │\n" "$W" "qdisc: ${qdisc}     CC: ${cc}"
   printf "│ %-*s │\n" "$W" "MTU: ${mtu:-?}    Service: ${svc_active}/${svc_enabled}"
@@ -232,30 +251,36 @@ install_service(){
   local dev="$1"
   local BIN="/usr/local/sbin/net-optimize.sh"
 
-  # اگر از pipe اجرا شده یا $0 فایل نیست → از GitHub بکش
+  # ensure script exists on disk (pipe-safe)
   if [[ ! -f "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "bash" ]]; then
-    if have curl; then
-      curl -fsSLo "$BIN" "$RAW_URL"
-    elif have wget; then
-      wget -qO "$BIN" "$RAW_URL"
-    else
-      die "curl/wget موجود نیست؛ نمی‌توان اسکریپت را در $BIN ذخیره کرد"
+    if have curl; then curl -fsSLo "$BIN" "$RAW_URL"
+    elif have wget; then wget -qO "$BIN" "$RAW_URL"
+    else die "curl/wget موجود نیست؛ نمی‌توان اسکریپت را در $BIN ذخیره کرد"
     fi
   else
     cp -f "${BASH_SOURCE[0]}" "$BIN"
   fi
   chmod +x "$BIN"
 
+  # auto-probe capabilities to decide flags for ExecStart
+  probe_offloads_support "$dev"
+  probe_coalesce_support "$dev"
+  local FLAGS="--apply --profile $PROFILE --iface %I ${MTU:+--mtu $MTU}"
+  $OFFLOADS_SUPPORTED || FLAGS+=" --no-offloads"
+  $COALESCE_SUPPORTED || FLAGS+=" --no-coalescing"
+  $PIN_IRQS && FLAGS+=" --pin-irqs"
+
   cat >"$SYSTEMD_UNIT_TEMPLATE" <<SERV
 [Unit]
-Description=Network optimize for %I
+Description=Network optimizations for %I (safe)
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=/sys/class/net/%I
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$BIN --apply --profile $PROFILE --iface %I ${MTU:+--mtu $MTU} ${TUNE_OFFLOADS:+} ${TUNE_COALESCE:+} ${PIN_IRQS:+--pin-irqs}
+ExecStart=$BIN $FLAGS
 
 [Install]
 WantedBy=multi-user.target
@@ -275,8 +300,7 @@ remove_service(){
 }
 
 main(){
-  parse_args "$@"
-  need_root
+  parse_args "$@"; need_root
   IFACE="$(detect_iface)"; [[ -z "$IFACE" ]] && die "iface پیدا نشد"
 
   case "$ACTION" in
@@ -287,7 +311,10 @@ main(){
     apply)
       p "[1/4] sysctl tuning …"; apply_sysctl
       p "[2/4] set MTU …"; set_mtu "$IFACE"
-      p "[3/4] NIC features …"; disable_offloads "$IFACE"; set_coalescing "$IFACE"; $PIN_IRQS && { p "[opt] pin IRQs"; pin_irqs "$IFACE"; }
+      # probe + apply NIC features safely
+      probe_offloads_support "$IFACE"; probe_coalesce_support "$IFACE"
+      $TUNE_OFFLOADS && disable_offloads "$IFACE"
+      $TUNE_COALESCE && set_coalescing "$IFACE"
       p "[4/4] install service …"; install_service "$IFACE"
       echo "✅ Done."; ui_panel "$IFACE"
       ;;
